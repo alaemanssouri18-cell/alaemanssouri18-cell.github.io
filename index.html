@@ -65,9 +65,9 @@ li:first-child{border-top:0}
   <p class="sub">Changez le format d’une image et réduisez son poids. Tout se passe sur votre téléphone, rien n’est envoyé.</p>
 
   <label class="drop">
-    <input id="pick" type="file" accept="image/*" multiple>
+    <input id="pick" type="file" multiple accept="image/*,.jpg,.jpeg,.jfif,.png,.webp,.heic,.heif,.avif,.gif,.bmp,.tiff,.tif,.3gp">
     <strong>Choisir des images</strong>
-    <span>Photos, captures, JPG, PNG, WebP</span>
+    <span>Tous formats : JPG, PNG, WebP, HEIC (iPhone), WhatsApp…</span>
   </label>
 
   <div class="card" id="files" hidden><ul id="flist"></ul></div>
@@ -107,7 +107,7 @@ li:first-child{border-top:0}
   <div class="card">
     <label>Réduire un PDF lourd</label>
     <p class="hint">Utilise la qualité et la largeur choisies plus haut. Chaque page devient une image : le texte ne sera plus sélectionnable.</p>
-    <label class="save pdfbtn"><input id="pdfpick" type="file" accept="application/pdf">Choisir un PDF à réduire</label>
+    <label class="save pdfbtn"><input id="pdfpick" type="file" accept="application/pdf,.pdf">Choisir un PDF à réduire</label>
   </div>
 </main>
 
@@ -116,9 +116,22 @@ li:first-child{border-top:0}
   var files=[], fmt="jpg", results=[];
   var $=function(i){return document.getElementById(i)};
   var MIME={jpg:"image/jpeg",png:"image/png",webp:"image/webp"};
+  /* Extensions photo connues : si un fichier en vient de WhatsApp ou d'ailleurs
+     sans type MIME correct, on se fie aussi à son extension. */
+  var IMG_EXT=/\.(jpe?g|jfif|png|webp|heic|heif|avif|gif|bmp|tiff?|dng|3gp)$/i;
 
   function size(n){return n>=1048576?(n/1048576).toFixed(2).replace(".",",")+" Mo":Math.max(1,Math.round(n/1024))+" Ko"}
   function say(t,c){var m=$("msg");m.textContent=t;m.className=c||""}
+
+  /* Un fichier est accepté s'il se dit image, ou si son extension ressemble
+     à une image, ou s'il n'a ni type ni extension reconnaissables (documents
+     WhatsApp). La lecture réelle tranchera plus tard. */
+  function looksLikeImage(f){
+    if(/^image\//.test(f.type))return true;
+    if(IMG_EXT.test(f.name))return true;
+    if(!f.type||f.type==="application/octet-stream"||f.type==="application/force-download")return true;
+    return false;
+  }
 
   function renderFiles(){
     var box=$("files"),ul=$("flist");ul.textContent="";
@@ -133,7 +146,7 @@ li:first-child{border-top:0}
   }
 
   $("pick").addEventListener("change",function(e){
-    Array.prototype.forEach.call(e.target.files,function(f){if(/^image\//.test(f.type))files.push(f)});
+    Array.prototype.forEach.call(e.target.files,function(f){if(looksLikeImage(f))files.push(f)});
     e.target.value="";results=[];$("res").hidden=true;say("");renderFiles();
   });
 
@@ -146,14 +159,71 @@ li:first-child{border-top:0}
   });
   $("q").addEventListener("input",function(){$("qv").textContent=$("q").value+" %"});
 
-  function load(file){
+  /* --- Détection du format réel par la signature du fichier (magic bytes).
+     Certains fichiers arrivent avec une mauvaise extension ou sans type. --- */
+  async function sniff(file){
+    var b=new Uint8Array(await file.slice(0,16).arrayBuffer());
+    var s="";for(var i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);
+    if(s.length>=4&&s.slice(0,4)==="RIFF"&&s.indexOf("WEBP")>0)return "webp";
+    if(s.slice(0,3)==="\xff\xd8\xff")return "jpg";
+    if(s.slice(0,8)==="\x89PNG\r\n\x1a\n")return "png";
+    if(s.slice(0,6)==="GIF87a"||s.slice(0,6)==="GIF89a")return "gif";
+    if(s.slice(0,2)==="BM")return "bmp";
+    if(s.slice(0,4)==="ftyp"||s.slice(4,8)==="ftyp"){
+      if(/heic|heix|hevc|heim|heis|mif1|msf1|hevx|avif/.test(s.slice(8,16)))return "heif";
+    }
+    return "";
+  }
+
+  /* --- Décodeur HEIC/HEIF (iPhone) : chargé à la demande uniquement,
+     car la bibliothèque est lourde. --- */
+  var heicLib=null;
+  function loadHeicLib(){
+    if(heicLib)return heicLib;
+    heicLib=new Promise(function(ok,ko){
+      var s=document.createElement("script");
+      s.src="https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js";
+      s.onload=function(){ok(window.heic2any)};
+      s.onerror=function(){heicLib=null;ko(new Error("Impossible de charger le décodeur HEIC. Vérifiez la connexion."))};
+      document.head.appendChild(s);
+    });
+    return heicLib;
+  }
+
+  function loadViaImage(file){
     return new Promise(function(ok,ko){
       var u=URL.createObjectURL(file),im=new Image();
       im.onload=function(){URL.revokeObjectURL(u);ok(im)};
-      im.onerror=function(){URL.revokeObjectURL(u);ko(new Error("Image illisible : "+file.name))};
+      im.onerror=function(){URL.revokeObjectURL(u);ko(new Error("nope"))};
       im.src=u;
     });
   }
+
+  async function loadHeic(file){
+    var lib=await loadHeicLib();
+    var blob=await lib({blob:file,toType:"image/png"});
+    var u=URL.createObjectURL(blob),im=new Image();
+    await new Promise(function(ok,ko){
+      im.onload=ok;im.onerror=function(){URL.revokeObjectURL(u);ko(new Error("HEIC illisible : "+file.name))};
+      im.src=u;
+    });
+    URL.revokeObjectURL(u);
+    return im;
+  }
+
+  /* Lecture universelle : essai direct, sinon HEIC, sinon message clair. */
+  async function load(file){
+    try{
+      return await loadViaImage(file);
+    }catch(e){
+      try{
+        return await loadHeic(file);
+      }catch(e2){
+        throw new Error("Image illisible : "+file.name+" (format non pris en charge)");
+      }
+    }
+  }
+
   function draw(im,maxW,flat){
     var w=im.naturalWidth,h=im.naturalHeight;
     if(maxW&&w>maxW){h=Math.round(h*maxW/w);w=maxW}
